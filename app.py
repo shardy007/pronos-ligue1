@@ -128,6 +128,110 @@ def predict_match2(home_team_id, away_team_id, standings, all_matches, w_base=0.
     except Exception as e:
         return 1, 1
 
+def predict_match_v3(home_id, away_id, home_name, away_name, all_matches, db_path=DB_NAME):
+    """
+    Modèle V3 Pro : Dixon-Coles Simplifié (Déclin Temporel + Expected Goals)
+    Donne un poids plus important aux matchs récents et intègre la qualité des tirs (xG).
+    """
+    import math
+    from datetime import datetime
+    import sqlite3
+    import pandas as pd
+
+    try:
+        # 1. Paramètres du modèle
+        xi = 0.0065  # Taux d'oubli : un match perd la moitié de son importance après ~100 jours
+        current_date = datetime.now()
+        
+        teams_stats = {
+            home_id: {'w_scored': 0, 'w_conceded': 0, 'weight_sum': 0},
+            away_id: {'w_scored': 0, 'w_conceded': 0, 'weight_sum': 0}
+        }
+        
+        league_w_goals = 0
+        league_weight_sum = 0
+        
+        # 2. Analyse de l'historique avec déclin temporel (Time Decay)
+        for m in all_matches.get('matches', []):
+            if m['status'] == 'FINISHED':
+                try:
+                    match_date = datetime.strptime(m['utcDate'][:10], "%Y-%m-%d")
+                    days_ago = (current_date - match_date).days
+                    if days_ago < 0: days_ago = 0
+                    
+                    # Formule d'amortissement exponentiel
+                    weight = math.exp(-xi * days_ago)
+                    
+                    h_team_id = m['homeTeam']['id']
+                    a_team_id = m['awayTeam']['id']
+                    h_goals = m['score']['fullTime']['home']
+                    a_goals = m['score']['fullTime']['away']
+                    
+                    # Statistiques globales Ligue 1 pondérées
+                    league_w_goals += (h_goals + a_goals) * weight
+                    league_weight_sum += 2 * weight
+                    
+                    # Calcul pour l'équipe Domicile
+                    if h_team_id in teams_stats:
+                        teams_stats[h_team_id]['w_scored'] += h_goals * weight
+                        teams_stats[h_team_id]['w_conceded'] += a_goals * weight
+                        teams_stats[h_team_id]['weight_sum'] += weight
+                        
+                    # Calcul pour l'équipe Extérieur
+                    if a_team_id in teams_stats:
+                        teams_stats[a_team_id]['w_scored'] += a_goals * weight
+                        teams_stats[a_team_id]['w_conceded'] += h_goals * weight
+                        teams_stats[a_team_id]['weight_sum'] += weight
+                except:
+                    continue
+
+        # Moyenne pondérée de buts par match en Ligue 1
+        league_avg = league_w_goals / league_weight_sum if league_weight_sum > 0 else 1.3
+        
+        def get_team_strengths(t_id):
+            ts = teams_stats[t_id]
+            if ts['weight_sum'] == 0: return 1.0, 1.0
+            
+            avg_scored = ts['w_scored'] / ts['weight_sum']
+            avg_conceded = ts['w_conceded'] / ts['weight_sum']
+            
+            # Force d'attaque et de défense relatives à la moyenne de la ligue
+            attack = avg_scored / league_avg if league_avg > 0 else 1.0
+            defense = avg_conceded / league_avg if league_avg > 0 else 1.0
+            return attack, defense
+
+        h_attack, h_defense = get_team_strengths(home_id)
+        a_attack, a_defense = get_team_strengths(away_id)
+
+        # 3. Intégration des Expected Goals (xG) depuis la BDD joueurs
+        def get_xg_boost(team_name):
+            try:
+                conn = sqlite3.connect(db_path)
+                df_xg = pd.read_sql_query("SELECT SUM(xg) as total_xg FROM joueurs WHERE team_name = ?", conn, params=[team_name])
+                conn.close()
+                total_xg = df_xg['total_xg'].iloc[0]
+                if pd.isna(total_xg): return 1.0
+                # Ajustement doux : on divise par 100 pour obtenir un multiplicateur (ex: 35 xG -> 1.35)
+                return 1.0 + (total_xg / 100) 
+            except:
+                return 1.0
+
+        h_xg_boost = get_xg_boost(home_name)
+        a_xg_boost = get_xg_boost(away_name)
+
+        # 4. Modèle de Poisson combiné (Espérance de buts)
+        home_advantage = 1.15 # Avantage terrain classique
+        
+        # Espérance Domicile = Attaque Dom * Défense Ext * Moyenne L1 * Domicile * Bonus xG
+        exp_home = h_attack * a_defense * league_avg * home_advantage * h_xg_boost
+        # Espérance Extérieur = Attaque Ext * Défense Dom * Moyenne L1 * Bonus xG
+        exp_away = a_attack * h_defense * league_avg * a_xg_boost
+
+        return round(exp_home), round(exp_away)
+
+    except Exception as e:
+        return 1, 1
+
 
 def calculate_exact_score(home_id, away_id, standings, all_matches, db_path):
     conn = sqlite3.connect(db_path)
@@ -557,29 +661,35 @@ elif st.session_state.page == "📅 Saison 2025-2026":
     if total_poids > 0:
         poids_class, poids_forme, poids_lieu = poids_class/total_poids, poids_forme/total_poids, poids_lieu/total_poids
 
-    # --- 3. CALCUL DES STATISTIQUES DOUBLES (V1 vs V2) ---
+    # --- 3. CALCUL DES STATISTIQUES TRIPLES (V1 vs V2 vs V3) ---
     c = conn.cursor()
     c.execute("SELECT match_id, pred_home, pred_away FROM pronostics")
     db_preds = {row[0]: (row[1], row[2]) for row in c.fetchall()}
 
-    v1_res_g = v1_ex_g = v2_res_g = v2_ex_g = count_g = 0
-    v1_res_d = v1_ex_d = v2_res_d = v2_ex_d = count_d = 0
+    v1_res_g = v1_ex_g = v2_res_g = v2_ex_g = v3_res_g = v3_ex_g = count_g = 0
+    v1_res_d = v1_ex_d = v2_res_d = v2_ex_d = v3_res_d = v3_ex_d = count_d = 0
 
     for m in all_matches['matches']:
         if m['status'] == 'FINISHED':
             rh, ra = m['score']['fullTime']['home'], m['score']['fullTime']['away']
             real_win = "H" if rh > ra else "A" if ra > rh else "D"
+            h_id, a_id = m['homeTeam']['id'], m['awayTeam']['id']
+            h_name, a_name = m['homeTeam']['name'], m['awayTeam']['name']
             
-            # Récupération/Calcul V1
+            # Calcul V1
             if m['id'] in db_preds:
                 ph1, pa1 = db_preds[m['id']]
             else:
-                ph1, pa1 = predict_match(m['homeTeam']['name'], m['awayTeam']['name'], standings)
+                ph1, pa1 = predict_match(h_name, a_name, standings)
             pred_win1 = "H" if ph1 > pa1 else "A" if pa1 > ph1 else "D"
             
-            # Calcul V2 dynamique AVEC LES CURSEURS
-            ph2, pa2 = predict_match2(m['homeTeam']['id'], m['awayTeam']['id'], standings, all_matches, poids_class, poids_forme, poids_lieu)
+            # Calcul V2 
+            ph2, pa2 = predict_match2(h_id, a_id, standings, all_matches)
             pred_win2 = "H" if ph2 > pa2 else "A" if pa2 > ph2 else "D"
+
+            # Calcul V3 (Markov/Time Decay)
+            ph3, pa3 = predict_match_v3(h_id, a_id, h_name, a_name, all_matches)
+            pred_win3 = "H" if ph3 > pa3 else "A" if pa3 > pa3 else "D"
 
             # Incrémentation Global
             count_g += 1
@@ -587,6 +697,8 @@ elif st.session_state.page == "📅 Saison 2025-2026":
             if ph1 == rh and pa1 == ra: v1_ex_g += 1
             if pred_win2 == real_win: v2_res_g += 1
             if ph2 == rh and pa2 == ra: v2_ex_g += 1
+            if pred_win3 == real_win: v3_res_g += 1
+            if ph3 == rh and pa3 == ra: v3_ex_g += 1
 
             # Incrémentation Journée
             if m['matchday'] == day_choice:
@@ -595,33 +707,29 @@ elif st.session_state.page == "📅 Saison 2025-2026":
                 if ph1 == rh and pa1 == ra: v1_ex_d += 1
                 if pred_win2 == real_win: v2_res_d += 1
                 if ph2 == rh and pa2 == ra: v2_ex_d += 1
+                if pred_win3 == real_win: v3_res_d += 1
+                if ph3 == rh and pa3 == ra: v3_ex_d += 1
 
     def calc_pct(val, total):
         return (val / total * 100) if total > 0 else 0
-	
+
     # --- 4. AFFICHAGE DES ENCARTS DE PERFORMANCE ---
     col_g, col_d = st.columns(2)
     
     with col_g:
         st.markdown(f"### 🌍 Global ({count_g} matchs)")
-        c1, c2 = st.columns(2)
-        c1.metric("✅ Résultat V1", f"{calc_pct(v1_res_g, count_g):.1f}%")
-        c2.metric("🎯 Exact V1", f"{calc_pct(v1_ex_g, count_g):.1f}%")
-        
-        c3, c4 = st.columns(2)
-        c3.metric("✅ Résultat V2", f"{calc_pct(v2_res_g, count_g):.1f}%")
-        c4.metric("🎯 Exact V2", f"{calc_pct(v2_ex_g, count_g):.1f}%")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("V1 (Base)", f"{calc_pct(v1_res_g, count_g):.1f}%")
+        c2.metric("V2 (Forme)", f"{calc_pct(v2_res_g, count_g):.1f}%")
+        c3.metric("V3 (Pro/Markov)", f"{calc_pct(v3_res_g, count_g):.1f}%")
 
     with col_d:
         st.markdown(f"### 📍 Journée {day_choice} ({count_d} matchs)")
         if count_d > 0:
-            c5, c6 = st.columns(2)
-            c5.metric("✅ Résultat V1", f"{calc_pct(v1_res_d, count_d):.1f}%")
-            c6.metric("🎯 Exact V1", f"{calc_pct(v1_ex_d, count_d):.1f}%")
-            
-            c7, c8 = st.columns(2)
-            c7.metric("✅ Résultat V2", f"{calc_pct(v2_res_d, count_d):.1f}%")
-            c8.metric("🎯 Exact V2", f"{calc_pct(v2_ex_d, count_d):.1f}%")
+            c4, c5, c6 = st.columns(3)
+            c4.metric("V1 (Base)", f"{calc_pct(v1_res_d, count_d):.1f}%")
+            c5.metric("V2 (Forme)", f"{calc_pct(v2_res_d, count_d):.1f}%")
+            c6.metric("V3 (Pro/Markov)", f"{calc_pct(v3_res_d, count_d):.1f}%")
         else:
             st.info("Matchs de la journée non terminés.")
 
